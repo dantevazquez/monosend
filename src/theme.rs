@@ -8,9 +8,9 @@ pub const BASE: Color = Color::Reset;
 pub const CRUST: Color = Color::Reset;
 
 /// Surface 0 element background color.
-pub const SURFACE0: Color = Color::Rgb(49, 50, 68);
+pub const SURFACE0: Color = Color::Reset;
 /// Surface 2 element background color.
-pub const SURFACE2: Color = Color::Rgb(88, 91, 112);
+pub const SURFACE2: Color = Color::Reset;
 
 /// Subtext 0 secondary text color.
 pub const SUBTEXT0: Color = Color::Reset;

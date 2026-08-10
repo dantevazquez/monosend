@@ -17,6 +17,7 @@ monosend share --clipboard
 ```bash
 cargo install --path .
 ```
+Make sure to have xclip or wl-clipboard for clipboard features
 
 ## License
 MIT
