@@ -53,12 +53,14 @@ async fn run_tui(paths: Vec<PathBuf>) -> Result<()> {
         fingerprint.clone(),
         service_port,
         event_tx.clone(),
-    ));
+        tls.client_identity.clone(),
+    )?);
     let client = Arc::new(LocalSendClient::new(
         alias.clone(),
         fingerprint.clone(),
         service_port,
-    ));
+        tls.client_identity,
+    )?);
 
     // A small LocalSend server is needed while sharing because devices answer
     // an active discovery scan through the HTTPS registration endpoint.

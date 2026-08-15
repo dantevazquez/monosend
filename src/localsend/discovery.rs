@@ -5,7 +5,8 @@ use crate::localsend::protocol::{
     DeviceType, LOCALSEND_DEFAULT_PORT, LOCALSEND_MULTICAST_ADDR, PROTOCOL_VERSION, Peer,
     RegisterDto,
 };
-use reqwest::Client;
+use crate::localsend::tls::build_client;
+use reqwest::{Client, Identity};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -29,19 +30,15 @@ impl DiscoveryEngine {
         fingerprint: String,
         port: u16,
         event_tx: UnboundedSender<AppEvent>,
-    ) -> Self {
-        let http_client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_else(|_| Client::new());
-
-        Self {
+        identity: Identity,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
             alias,
             fingerprint,
             port,
             event_tx,
-            http_client,
-        }
+            http_client: build_client(identity)?,
+        })
     }
 
     /// Starts the background UDP discovery listener and announcement ticker.

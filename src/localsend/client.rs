@@ -5,8 +5,9 @@ use crate::localsend::protocol::{
     DeviceType, FileDto, PROTOCOL_VERSION, Peer, PrepareUploadReqDto, PrepareUploadRespDto,
     RegisterDto,
 };
+use crate::localsend::tls::build_client;
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, Identity};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs::File;
@@ -23,18 +24,18 @@ pub struct LocalSendClient {
 
 impl LocalSendClient {
     /// Creates a new `LocalSendClient` instance configured with local device credentials.
-    pub fn new(alias: String, fingerprint: String, port: u16) -> Self {
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_else(|_| Client::new());
-
-        Self {
-            client,
+    pub fn new(
+        alias: String,
+        fingerprint: String,
+        port: u16,
+        identity: Identity,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            client: build_client(identity)?,
             alias,
             fingerprint,
             port,
-        }
+        })
     }
 
     /// Uploads specified files to a target `Peer` device, emitting progress events.

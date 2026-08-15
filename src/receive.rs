@@ -32,7 +32,8 @@ pub async fn run(port: u16, autoaccept: bool) -> Result<()> {
         tls.fingerprint.clone(),
         port,
         event_tx.clone(),
-    ));
+        tls.client_identity,
+    )?);
     let discovery_future = discovery.start();
     let server_future = start_server(
         alias,

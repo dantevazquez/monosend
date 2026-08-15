@@ -96,4 +96,4 @@ pub const LOCALSEND_MULTICAST_ADDR: &str = "224.0.0.167";
 /// Default LocalSend UDP/HTTPS port.
 pub const LOCALSEND_DEFAULT_PORT: u16 = 53317;
 /// LocalSend protocol version string.
-pub const PROTOCOL_VERSION: &str = "2.1";
+pub const PROTOCOL_VERSION: &str = "2.2";
