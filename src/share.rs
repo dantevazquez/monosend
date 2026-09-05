@@ -1,30 +1,25 @@
-//! Focused LocalSend device-picker TUI for outgoing shares.
+//! Simple terminal workflow for outgoing LocalSend shares.
 
-use crate::events::AppEvent;
+use crate::events::{AppEvent, IncomingTransferRequest};
 use crate::localsend::client::LocalSendClient;
 use crate::localsend::discovery::{DiscoveryEngine, get_local_v4_ips};
 use crate::localsend::protocol::Peer;
 use crate::localsend::tls::generate_self_signed_cert;
 use crate::receive::device_alias;
-use crate::{theme, utils};
+use crate::utils::format_size;
 use color_eyre::{
     Result,
     eyre::{WrapErr, eyre},
 };
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use futures_util::StreamExt;
-use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph},
-};
-use std::collections::HashMap;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
+
+const ADDITIONAL_DEVICE_WAIT: Duration = Duration::from_secs(1);
 
 pub async fn run(paths: Vec<PathBuf>, include_clipboard: bool) -> Result<()> {
     let mut paths = validate_files(paths)?;
@@ -36,12 +31,12 @@ pub async fn run(paths: Vec<PathBuf>, include_clipboard: bool) -> Result<()> {
         None
     };
 
-    let result = run_tui(paths).await;
+    let result = run_cli(paths).await;
     drop(clipboard_file);
     result
 }
 
-async fn run_tui(paths: Vec<PathBuf>) -> Result<()> {
+async fn run_cli(paths: Vec<PathBuf>) -> Result<()> {
     let alias = device_alias();
     let tls = generate_self_signed_cert(&alias)
         .map_err(|error| eyre!("could not create LocalSend identity: {error}"))?;
@@ -55,12 +50,12 @@ async fn run_tui(paths: Vec<PathBuf>) -> Result<()> {
         event_tx.clone(),
         tls.client_identity.clone(),
     )?);
-    let client = Arc::new(LocalSendClient::new(
+    let client = LocalSendClient::new(
         alias.clone(),
         fingerprint.clone(),
         service_port,
         tls.client_identity,
-    )?);
+    )?;
 
     // A small LocalSend server is needed while sharing because devices answer
     // an active discovery scan through the HTTPS registration endpoint.
@@ -96,219 +91,179 @@ async fn run_tui(paths: Vec<PathBuf>) -> Result<()> {
         }
     });
 
-    trigger_scan(discovery.clone()).await;
+    let total_size = paths
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    println!(
+        "Sharing {} file(s) ({})",
+        paths.len(),
+        format_size(total_size)
+    );
+    println!("Searching for nearby LocalSend devices...");
 
-    let mut terminal = ratatui::init();
-    let result = async {
-        let mut app = ShareApp::new(paths, alias, fingerprint);
-        let mut input = EventStream::new();
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    // Give the server and UDP listener a chance to bind before announcing.
+    tokio::task::yield_now().await;
+    trigger_scan(discovery).await;
 
-        loop {
-            terminal.draw(|frame| render(frame, &app))?;
-
-            tokio::select! {
-                _ = tick.tick() => {}
-                maybe_input = input.next() => {
-                    match maybe_input {
-                        Some(Ok(Event::Key(key)))
-                            if key.kind == KeyEventKind::Press
-                                && handle_key(
-                                    key,
-                                    &mut app,
-                                    &client,
-                                    &event_tx,
-                                    discovery.clone(),
-                                )
-                                .await =>
-                        {
-                            break;
-                        }
-                        Some(Err(error)) => return Err(error.into()),
-                        None => break,
-                        _ => {}
-                    }
-                }
-                Some(event) = event_rx.recv() => app.handle_event(event),
-            }
-        }
-
-        Ok(())
+    let peers = discover_peers(&mut event_rx, &alias, &fingerprint).await?;
+    if peers.is_empty() {
+        return Err(eyre!(
+            "no nearby LocalSend devices found; make sure the receiving device is visible and try again"
+        ));
     }
-    .await;
-    ratatui::restore();
+
+    let peer = prompt_for_peer(&peers)?;
+    println!("Waiting for {} to accept the transfer...", peer.alias);
+
+    let monitor = monitor_transfer(&mut event_rx);
+    let (_, result) = tokio::join!(client.send_files(peer, paths, event_tx), monitor);
     result
 }
 
-#[derive(Debug)]
-enum ShareState {
-    Selecting,
-    Sending {
-        bytes: u64,
-        total: u64,
-        label: String,
-    },
-    Completed(String),
-    Failed(String),
-}
+async fn discover_peers(
+    event_rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    alias: &str,
+    fingerprint: &str,
+) -> Result<Vec<Peer>> {
+    let mut peers = Vec::new();
 
-struct ShareApp {
-    paths: Vec<PathBuf>,
-    alias: String,
-    fingerprint: String,
-    peers: Vec<Peer>,
-    peer_indexes: HashMap<String, usize>,
-    selected: usize,
-    state: ShareState,
-    status: String,
-}
+    loop {
+        let event = if peers.is_empty() {
+            event_rx.recv().await
+        } else {
+            match timeout(ADDITIONAL_DEVICE_WAIT, event_rx.recv()).await {
+                Ok(event) => event,
+                Err(_) => break,
+            }
+        };
 
-impl ShareApp {
-    fn new(paths: Vec<PathBuf>, alias: String, fingerprint: String) -> Self {
-        Self {
-            paths,
-            alias,
-            fingerprint,
-            peers: Vec::new(),
-            peer_indexes: HashMap::new(),
-            selected: 0,
-            state: ShareState::Selecting,
-            status: "Searching for nearby LocalSend devices…".to_string(),
+        match event {
+            Some(AppEvent::PeerDiscovered(peer)) => {
+                add_peer(&mut peers, peer, alias, fingerprint);
+            }
+            Some(AppEvent::IncomingTransfer(request)) => decline_transfer(request),
+            Some(AppEvent::StatusMessage(message)) => return Err(eyre!(message)),
+            Some(_) => {}
+            None => return Err(eyre!("device discovery stopped unexpectedly")),
         }
     }
 
-    fn handle_event(&mut self, event: AppEvent) {
+    Ok(peers)
+}
+
+fn add_peer(peers: &mut Vec<Peer>, peer: Peer, alias: &str, fingerprint: &str) {
+    if peer.fingerprint == fingerprint || is_own_receiver(&peer, alias) {
+        return;
+    }
+
+    if let Some(index) = peers
+        .iter()
+        .position(|known| known.fingerprint == peer.fingerprint)
+    {
+        peers[index] = peer;
+    } else {
+        peers.push(peer);
+    }
+}
+
+fn is_own_receiver(peer: &Peer, alias: &str) -> bool {
+    if peer.alias != alias {
+        return false;
+    }
+
+    let local_ips = get_local_v4_ips();
+    peer.ip
+        .parse()
+        .map(|ip| local_ips.contains(&ip))
+        .unwrap_or(false)
+}
+
+fn prompt_for_peer(peers: &[Peer]) -> Result<Peer> {
+    println!();
+    println!("Choose who you want to send to:");
+    for (index, peer) in peers.iter().enumerate() {
+        let model = peer.device_model.as_deref().unwrap_or("Unknown device");
+        println!("  {}. {} - {} ({})", index + 1, peer.alias, model, peer.ip);
+    }
+
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    loop {
+        print!("Enter a number (1-{}): ", peers.len());
+        std::io::stdout()
+            .flush()
+            .wrap_err("could not display the device prompt")?;
+
+        let mut input = String::new();
+        if stdin
+            .read_line(&mut input)
+            .wrap_err("could not read the device selection")?
+            == 0
+        {
+            return Err(eyre!("no device was selected"));
+        }
+
+        if let Some(index) = parse_selection(&input, peers.len()) {
+            return Ok(peers[index].clone());
+        }
+
+        println!("Please enter a number from 1 to {}.", peers.len());
+    }
+}
+
+fn parse_selection(input: &str, peer_count: usize) -> Option<usize> {
+    let selection = input.trim().parse::<usize>().ok()?;
+    selection.checked_sub(1).filter(|index| *index < peer_count)
+}
+
+async fn monitor_transfer(event_rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> Result<()> {
+    let mut last_reported_percent = 0;
+
+    while let Some(event) = event_rx.recv().await {
         match event {
-            AppEvent::PeerDiscovered(peer) => self.add_peer(peer),
             AppEvent::TransferProgress {
+                file_id,
                 bytes_transferred,
                 total_bytes,
-                file_id,
-                is_upload,
+                is_upload: true,
                 ..
-            } => {
-                if is_upload {
-                    self.state = ShareState::Sending {
-                        bytes: bytes_transferred,
-                        total: total_bytes,
-                        label: file_id,
-                    };
+            } if total_bytes > 0 => {
+                let percent = (bytes_transferred.saturating_mul(100) / total_bytes).min(100);
+                if percent == 100 || percent >= last_reported_percent + 10 {
+                    println!(
+                        "Sending {file_id}: {} / {} ({percent}%)",
+                        format_size(bytes_transferred),
+                        format_size(total_bytes)
+                    );
+                    last_reported_percent = percent;
                 }
             }
             AppEvent::TransferCompleted { message, .. } => {
-                self.state = ShareState::Completed(message);
+                println!("{message}");
+                return Ok(());
             }
-            AppEvent::TransferFailed { error, .. } => {
-                self.state = ShareState::Failed(error);
-            }
-            AppEvent::StatusMessage(message) => self.status = message,
-            AppEvent::FileReceived { .. } => {}
-            AppEvent::IncomingTransfer(request) => {
-                let sender = request
-                    .response_tx
-                    .lock()
-                    .ok()
-                    .and_then(|mut response| response.take());
-                if let Some(sender) = sender {
-                    let _ = sender.send(false);
-                }
-            }
+            AppEvent::TransferFailed { error, .. } => return Err(eyre!(error)),
+            AppEvent::IncomingTransfer(request) => decline_transfer(request),
+            AppEvent::StatusMessage(message) => eprintln!("{message}"),
+            AppEvent::PeerDiscovered(_)
+            | AppEvent::FileReceived { .. }
+            | AppEvent::TransferProgress { .. } => {}
         }
     }
 
-    fn add_peer(&mut self, peer: Peer) {
-        if peer.fingerprint == self.fingerprint || self.is_own_receiver(&peer) {
-            return;
-        }
-
-        if let Some(index) = self.peer_indexes.get(&peer.fingerprint).copied() {
-            self.peers[index] = peer;
-        } else {
-            let index = self.peers.len();
-            self.peer_indexes.insert(peer.fingerprint.clone(), index);
-            self.peers.push(peer);
-            self.status = format!("Found {} nearby device(s)", self.peers.len());
-        }
-    }
-
-    fn is_own_receiver(&self, peer: &Peer) -> bool {
-        if peer.alias != self.alias {
-            return false;
-        }
-        let local_ips = get_local_v4_ips();
-        peer.ip
-            .parse()
-            .map(|ip| local_ips.contains(&ip))
-            .unwrap_or(false)
-    }
-
-    fn total_size(&self) -> u64 {
-        self.paths
-            .iter()
-            .filter_map(|path| std::fs::metadata(path).ok())
-            .map(|metadata| metadata.len())
-            .sum()
-    }
+    Err(eyre!("the transfer stopped before it completed"))
 }
 
-async fn handle_key(
-    key: KeyEvent,
-    app: &mut ShareApp,
-    client: &Arc<LocalSendClient>,
-    event_tx: &mpsc::UnboundedSender<AppEvent>,
-    discovery: Arc<DiscoveryEngine>,
-) -> bool {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return true;
-    }
-
-    match &app.state {
-        ShareState::Completed(_) | ShareState::Failed(_) => {
-            return matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'));
-        }
-        ShareState::Sending { .. } => {
-            return matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
-        }
-        ShareState::Selecting => {}
-    }
-
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => true,
-        KeyCode::Up | KeyCode::Char('k') => {
-            if !app.peers.is_empty() {
-                app.selected = app.selected.checked_sub(1).unwrap_or(app.peers.len() - 1);
-            }
-            false
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if !app.peers.is_empty() {
-                app.selected = (app.selected + 1) % app.peers.len();
-            }
-            false
-        }
-        KeyCode::Char('r') | KeyCode::F(5) => {
-            app.status = "Scanning the local network…".to_string();
-            trigger_scan(discovery).await;
-            false
-        }
-        KeyCode::Enter => {
-            if let Some(peer) = app.peers.get(app.selected).cloned() {
-                let paths = app.paths.clone();
-                let total = app.total_size();
-                app.state = ShareState::Sending {
-                    bytes: 0,
-                    total,
-                    label: format!("Waiting for {} to accept…", peer.alias),
-                };
-                let client = client.clone();
-                let events = event_tx.clone();
-                tokio::spawn(async move {
-                    client.send_files(peer, paths, events).await;
-                });
-            }
-            false
-        }
-        _ => false,
+fn decline_transfer(request: IncomingTransferRequest) {
+    let sender = request
+        .response_tx
+        .lock()
+        .ok()
+        .and_then(|mut response| response.take());
+    if let Some(sender) = sender {
+        let _ = sender.send(false);
     }
 }
 
@@ -317,221 +272,6 @@ async fn trigger_scan(discovery: Arc<DiscoveryEngine>) {
         let _ = socket.set_broadcast(true);
         let _ = discovery.announce(&socket).await;
     }
-}
-
-fn render(frame: &mut Frame, app: &ShareApp) {
-    let area = frame.area();
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme::BASE)),
-        area,
-    );
-    let area = centered_rect(82, 82, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::GREEN))
-        .title(Span::styled(
-            " monosend share ",
-            Style::default()
-                .fg(theme::GREEN)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(theme::CRUST));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    match &app.state {
-        ShareState::Selecting => render_picker(frame, app, inner),
-        ShareState::Sending {
-            bytes,
-            total,
-            label,
-        } => render_progress(frame, inner, *bytes, *total, label),
-        ShareState::Completed(message) => render_result(frame, inner, true, message),
-        ShareState::Failed(message) => render_result(frame, inner, false, message),
-    }
-}
-
-fn render_picker(frame: &mut Frame, app: &ShareApp, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(4),
-            Constraint::Length(2),
-        ])
-        .split(area);
-
-    let names = app
-        .paths
-        .iter()
-        .take(3)
-        .map(|path| path.file_name().unwrap_or_default().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let suffix = if app.paths.len() > 3 { ", …" } else { "" };
-    let summary = Paragraph::new(vec![
-        Line::from(Span::styled(
-            format!(
-                "Share {} file(s) · {}",
-                app.paths.len(),
-                utils::format_size(app.total_size())
-            ),
-            Style::default()
-                .fg(theme::TEXT)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!("{names}{suffix}"),
-            Style::default().fg(theme::SUBTEXT0),
-        )),
-    ])
-    .alignment(Alignment::Center)
-    .block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(theme::SURFACE2)),
-    );
-    frame.render_widget(summary, chunks[0]);
-
-    if app.peers.is_empty() {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Searching for nearby LocalSend devices…",
-                    Style::default()
-                        .fg(theme::YELLOW)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    &app.status,
-                    Style::default().fg(theme::SUBTEXT0),
-                )),
-            ])
-            .alignment(Alignment::Center),
-            chunks[1],
-        );
-    } else {
-        let items = app
-            .peers
-            .iter()
-            .map(|peer| {
-                let model = peer.device_model.as_deref().unwrap_or(&peer.version);
-                ListItem::new(format!("{}  {}  ({})", peer.alias, model, peer.ip))
-                    .style(Style::default().fg(theme::TEXT))
-            })
-            .collect::<Vec<_>>();
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::SURFACE2))
-                    .title(" Receivers "),
-            )
-            .highlight_symbol("› ")
-            .highlight_style(
-                Style::default()
-                    .fg(theme::YELLOW)
-                    .bg(theme::SURFACE0)
-                    .add_modifier(Modifier::BOLD),
-            );
-        let mut state = ListState::default().with_selected(Some(app.selected));
-        frame.render_stateful_widget(list, chunks[1], &mut state);
-    }
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "↑/↓ select · Enter send · r rescan · q quit",
-            Style::default().fg(theme::SUBTEXT0),
-        )))
-        .alignment(Alignment::Center),
-        chunks[2],
-    );
-}
-
-fn render_progress(frame: &mut Frame, area: Rect, bytes: u64, total: u64, label: &str) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Length(4),
-            Constraint::Min(3),
-        ])
-        .split(area);
-    let ratio = if total == 0 {
-        0.0
-    } else {
-        (bytes as f64 / total as f64).clamp(0.0, 1.0)
-    };
-    let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title(" Sending "))
-        .gauge_style(Style::default().fg(theme::GREEN).bg(theme::SURFACE0))
-        .ratio(ratio)
-        .label(format!("{:.0}%", ratio * 100.0));
-    frame.render_widget(gauge, chunks[1]);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(label, Style::default().fg(theme::TEXT))),
-            Line::from(Span::styled(
-                format!(
-                    "{} / {} · q to close",
-                    utils::format_size(bytes),
-                    utils::format_size(total)
-                ),
-                Style::default().fg(theme::SUBTEXT0),
-            )),
-        ])
-        .alignment(Alignment::Center),
-        chunks[2],
-    );
-}
-
-fn render_result(frame: &mut Frame, area: Rect, success: bool, message: &str) {
-    let color = if success { theme::GREEN } else { theme::RED };
-    let title = if success {
-        "Transfer complete"
-    } else {
-        "Transfer failed"
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                title,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(message, Style::default().fg(theme::TEXT))),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press Enter or q to close",
-                Style::default().fg(theme::SUBTEXT0),
-            )),
-        ])
-        .alignment(Alignment::Center),
-        area,
-    );
-}
-
-fn centered_rect(horizontal_percent: u16, vertical_percent: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - vertical_percent) / 2),
-            Constraint::Percentage(vertical_percent),
-            Constraint::Percentage((100 - vertical_percent) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - horizontal_percent) / 2),
-            Constraint::Percentage(horizontal_percent),
-            Constraint::Percentage((100 - horizontal_percent) / 2),
-        ])
-        .split(vertical[1])[1]
 }
 
 fn validate_files(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -630,5 +370,14 @@ mod tests {
     fn rejects_directories_as_share_inputs() {
         let result = validate_files(vec![std::env::temp_dir()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_numbered_device_selections() {
+        assert_eq!(parse_selection("1\n", 3), Some(0));
+        assert_eq!(parse_selection(" 3 ", 3), Some(2));
+        assert_eq!(parse_selection("0", 3), None);
+        assert_eq!(parse_selection("4", 3), None);
+        assert_eq!(parse_selection("device", 3), None);
     }
 }

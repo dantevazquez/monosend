@@ -11,7 +11,6 @@ mod events;
 mod localsend;
 mod receive;
 mod share;
-mod theme;
 mod utils;
 
 use localsend::protocol::LOCALSEND_DEFAULT_PORT;
@@ -24,7 +23,7 @@ Usage:
 
 Commands:
   receive    Listen for incoming LocalSend transfers
-  share      Open a device picker and send files
+  share      Choose a numbered device and send files
 
 Receive options:
   --port PORT       HTTPS port to listen on (default: 53317)
@@ -53,8 +52,8 @@ Options:
 
 const SHARE_HELP: &str = r#"Usage: monosend share [OPTIONS] <FILE>...
 
-Open a focused terminal device picker, discover nearby LocalSend devices, and
-send the supplied files after a receiver is selected.
+Discover nearby LocalSend devices, ask for a receiver by number, and send the
+supplied files after a receiver is selected.
 
 Options:
   --clipboard       Add the current text clipboard as clipboard.txt
